@@ -1,0 +1,26 @@
+# Neon - Robot Dog Brain
+# Python 3.10+
+
+# === Android UI Framework ===
+kivy>=2.3.0
+
+# === Robot Control (Unitree Go2 WebRTC) ===
+unitree-webrtc-connect>=2.0.4
+aiortc>=1.9.0
+
+# === OpenAI Realtime API (Voice Conversation) ===
+websocket-client>=1.7.0
+openai>=1.50.0
+
+# === Configuration ===
+pyyaml>=6.0
+
+# === SSL/TLS (Android certificate handling) ===
+certifi>=2024.0
+
+# === Audio processing ===
+numpy>=1.24.0
+
+# === Android-specific (installed via Buildozer) ===
+# pyjnius (auto-included)
+# android (auto-included)

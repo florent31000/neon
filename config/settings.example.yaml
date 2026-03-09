@@ -1,0 +1,48 @@
+# ============================================
+# NEON - ROBOT DOG BRAIN CONFIGURATION (EXAMPLE)
+# ============================================
+# Copy this to settings.yaml and fill in your API keys.
+
+robot:
+  name: "Néon"
+  language: "fr"
+  masters:
+    - "Caroline"
+    - "Sam"
+    - "Florent"
+
+api_keys:
+  openai: "YOUR_OPENAI_API_KEY_HERE"
+
+connection:
+  method: "ap"
+  robot_ip: "192.168.12.1"
+  auto_connect: true
+  serial_number: ""
+  remote_username: ""
+  remote_password: ""
+
+voice:
+  model: "gpt-4o-realtime-preview"
+  voice: "alloy"
+  input_sample_rate: 16000
+  output_sample_rate: 24000
+  turn_detection: "server_vad"
+  vad_threshold: 0.3
+  silence_duration_ms: 700
+  local_energy_threshold: 120
+  chunk_ms: 100
+  mute_after_speech_ms: 200
+
+movement:
+  max_speed: 0.8
+  rotation_speed: 1.0
+  obstacle_avoidance: true
+
+behavior:
+  conversation_timeout_seconds: 30
+  emergency_stop_phrase: "STOP"
+
+safety:
+  stop_on_disconnect: true
+  max_continuous_walk_seconds: 60
