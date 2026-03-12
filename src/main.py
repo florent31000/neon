@@ -212,7 +212,6 @@ class NeonApp(App):
             if ok:
                 Clock.schedule_once(lambda dt: self._restart_voice_after_robot_connect(), 0)
                 break
-            Clock.schedule_once(lambda dt: self._restart_voice_after_robot_connect(), 0)
             log(f"Robot connection retry in {wait}s (attempt {attempt}/5)...", "WARNING")
             await asyncio.sleep(wait)
         else:

@@ -23,7 +23,7 @@ connection:
   remote_password: ""
 
 voice:
-  model: "gpt-4o-realtime-preview"
+  model: "gpt-realtime-1.5"
   voice: "alloy"
   input_sample_rate: 16000
   output_sample_rate: 24000

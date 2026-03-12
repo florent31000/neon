@@ -90,7 +90,7 @@ class RobotController:
 
             from src.vendor.unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection
             from src.vendor.unitree_webrtc_connect.constants import WebRTCConnectionMethod
-            from src.utils.network import bind_to_wifi
+            from src.utils import network as _netmod
 
             if method == "sta":
                 if serial and not robot_ip:
@@ -113,20 +113,23 @@ class RobotController:
                     WebRTCConnectionMethod.LocalAP
                 )
 
-            bind_to_wifi()
+            _netmod._find_networks()
+            if _netmod._wifi_network is not None:
+                _netmod.bind_to_wifi()
+            else:
+                log("No WiFi network available, skipping connection attempt", "WARNING")
+                raise RuntimeError("No WiFi network available")
             try:
                 await self._conn.connect()
             except Exception:
-                from src.utils.network import unbind
                 try:
-                    unbind()
+                    _netmod.unbind()
                 except Exception:
                     pass
                 raise
 
-            from src.utils.network import unbind
             try:
-                unbind()
+                _netmod.unbind()
             except Exception:
                 pass
 

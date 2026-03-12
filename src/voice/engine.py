@@ -174,7 +174,7 @@ class VoiceEngine:
         self._is_audio_playing = is_audio_playing
 
         voice_cfg = config.get("voice", {})
-        self._model = voice_cfg.get("model", "gpt-4o-realtime-preview")
+        self._model = voice_cfg.get("model", "gpt-realtime-1.5")
         self._voice = voice_cfg.get("voice", "alloy")
         self._turn_detection = voice_cfg.get("turn_detection", "server_vad")
         self._vad_threshold = voice_cfg.get("vad_threshold", 0.5)
@@ -193,6 +193,7 @@ class VoiceEngine:
         self._pending_tool_calls: Dict[str, Dict] = {}
         self._last_send_error_log_ts = 0.0
         self._tts_chunk_count = 0
+        self._audio_send_count = 0
 
     @property
     def is_connected(self) -> bool:
@@ -248,17 +249,18 @@ class VoiceEngine:
         if self._is_audio_playing and self._is_audio_playing():
             return
 
-        if self._energy_threshold > 0:
-            energy = _estimate_energy(pcm16_bytes)
-            if energy < self._energy_threshold:
-                return
-
         try:
-            b64 = base64.b64encode(pcm16_bytes).decode("ascii")
+            resampled = _resample_16k_to_24k(pcm16_bytes)
+            b64 = base64.b64encode(resampled).decode("ascii")
             self._ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": b64,
             }))
+            self._audio_send_count += 1
+            if self._audio_send_count == 1:
+                log(f"First audio chunk sent to API ({len(pcm16_bytes)}B -> {len(resampled)}B resampled)", "INFO")
+            elif self._audio_send_count % 500 == 0:
+                log(f"Audio chunks sent: {self._audio_send_count}", "DEBUG")
         except Exception as e:
             now = time.time()
             if now - self._last_send_error_log_ts > 2.0:
@@ -300,7 +302,6 @@ class VoiceEngine:
         url = f"{self.WS_URL}?model={self._model}"
         headers = [
             f"Authorization: Bearer {self._api_key}",
-            "OpenAI-Beta: realtime=v1",
         ]
 
         connected = False
@@ -339,19 +340,23 @@ class VoiceEngine:
         }
 
         session = {
-            "modalities": ["audio", "text"],
+            "type": "realtime",
+            "output_modalities": ["audio"],
             "instructions": instructions,
-            "voice": self._voice,
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "turn_detection": turn_detection_config,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "noise_reduction": {"type": "near_field"},
+                    "transcription": {
+                        "model": "gpt-4o-mini-transcribe",
+                        "language": "fr",
+                    },
+                    "turn_detection": turn_detection_config,
+                },
+                "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": self._voice},
+            },
             "tools": TOOLS,
             "tool_choice": "auto",
-            "input_audio_transcription": {
-                "model": "gpt-4o-mini-transcribe",
-                "language": "fr",
-                "prompt": "Conversation en français avec un chien robot nommé Néon. Les interlocuteurs sont des adultes et des enfants de 5 ans. Commandes fréquentes : donne la patte, assis, couché, avance, recule, tourne, danse, fais un cœur, Néon, stop.",
-            },
         }
 
         self._ws.send(json.dumps({"type": "session.update", "session": session}))
@@ -429,12 +434,14 @@ class VoiceEngine:
         etype = event.get("type", "")
 
         if etype in ("session.created", "session.updated"):
+            log(f"Session event: {etype}", "INFO")
             return
 
         # ── Server VAD speech events ──
         if etype in ("input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"):
             still_playing = self._is_audio_playing and self._is_audio_playing()
             in_mute = time.time() < self._mute_until
+            log(f"VAD event: {etype} (playing={still_playing}, mute={in_mute}, speaking={self._is_speaking})", "DEBUG")
 
             if still_playing or in_mute or self._is_speaking:
                 if etype == "input_audio_buffer.speech_stopped":
@@ -447,7 +454,7 @@ class VoiceEngine:
             return
 
         # ── Audio output (TTS) ──
-        if etype == "response.audio.delta":
+        if etype == "response.output_audio.delta":
             audio_b64 = event.get("delta", "")
             if audio_b64 and self._on_audio_output:
                 if not self._is_speaking:
@@ -471,7 +478,7 @@ class VoiceEngine:
                     pass
             return
 
-        if etype == "response.audio.done":
+        if etype == "response.output_audio.done":
             self._is_speaking = False
             self._mute_until = time.time() + self._mute_after_ms
             log(f"Assistant audio output finished ({self._tts_chunk_count} chunks)", "INFO")
@@ -488,12 +495,12 @@ class VoiceEngine:
             return
 
         # ── Text transcript (assistant) ──
-        if etype == "response.audio_transcript.delta":
+        if etype == "response.output_audio_transcript.delta":
             delta = event.get("delta", "")
             self._assistant_text += delta
             return
 
-        if etype == "response.audio_transcript.done":
+        if etype == "response.output_audio_transcript.done":
             text = event.get("transcript", self._assistant_text)
             if text and self._on_transcript:
                 try:
@@ -558,6 +565,8 @@ class VoiceEngine:
                 return
             log(f"Realtime API error: {msg}", "ERROR")
             return
+
+        log(f"Unhandled event: {etype}", "DEBUG")
 
     def _cancel_spurious_turn(self, item_id: str):
         if not self._ws:
@@ -625,17 +634,28 @@ class VoiceEngine:
             log(f"Failed to send tool result: {e}", "ERROR")
 
 def _estimate_energy(pcm16_bytes: bytes) -> int:
-    """Quick RMS energy estimate for PCM16 mono audio."""
+    """Quick RMS energy estimate for PCM16 mono audio using numpy."""
     if len(pcm16_bytes) < 2:
         return 0
-    total = 0
-    count = len(pcm16_bytes) // 2
-    for i in range(0, len(pcm16_bytes) - 1, 2):
-        sample = int.from_bytes(pcm16_bytes[i:i + 2], "little", signed=True)
-        total += sample * sample
-    if count == 0:
+    import numpy as np
+    samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float64)
+    if len(samples) == 0:
         return 0
-    return int((total / count) ** 0.5)
+    return int(np.sqrt(np.mean(samples * samples)))
+
+
+def _resample_16k_to_24k(pcm16_bytes: bytes) -> bytes:
+    """Resample PCM16 mono from 16kHz to 24kHz using numpy linear interpolation."""
+    import numpy as np
+    samples_in = np.frombuffer(pcm16_bytes, dtype=np.int16)
+    n = len(samples_in)
+    if n < 2:
+        return pcm16_bytes
+    n_out = (n * 3 + 1) // 2
+    x_in = np.arange(n, dtype=np.float32)
+    x_out = np.linspace(0, n - 1, n_out, dtype=np.float32)
+    samples_out = np.interp(x_out, x_in, samples_in.astype(np.float32))
+    return np.clip(samples_out, -32768, 32767).astype(np.int16).tobytes()
 
 
 def _normalize_text(text: str) -> str:
