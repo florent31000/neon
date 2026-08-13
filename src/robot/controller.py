@@ -188,6 +188,7 @@ class RobotController:
 
     async def _send_wireless(self, lx=0.0, ly=0.0, rx=0.0, ry=0.0, keys=0) -> bool:
         if not self._conn or not self._connected:
+            log(f"Wireless skipped: conn={self._conn is not None} connected={self._connected}", "DEBUG")
             return False
         try:
             from src.vendor.unitree_webrtc_connect.constants import RTC_TOPIC
@@ -249,17 +250,26 @@ class RobotController:
             await asyncio.sleep(0.1)
 
     async def turn(self, direction="left", angle=90) -> str:
-        """Turn the robot using wireless controller (joystick) for obstacle avoidance support."""
+        """Turn the robot using wireless controller (joystick) for obstacle avoidance support.
+        angle=0 means continuous until stop_robot is called."""
         if not self._connected:
             return "Body not connected, cannot turn."
 
+        turn_rx = min(self._rotation_speed, 0.5)
+        rx = -turn_rx if direction == "left" else turn_rx
+
+        if angle == 0:
+            log(f"Turning {direction} continuously (rx={rx:.2f})", "ROBOT")
+            self._moving = True
+            asyncio.ensure_future(self._continuous_move_wireless(0, 0, rx, 0))
+            return f"Turning {direction} continuously — call stop_robot to stop"
+
         import math
         angle_rad = abs(angle) * math.pi / 180.0
-        rx = -self._rotation_speed if direction == "left" else self._rotation_speed
+        real_angular_speed = turn_rx * 4.0
+        duration = angle_rad / real_angular_speed
 
-        duration = angle_rad / self._rotation_speed
-
-        log(f"Turning {direction} {angle}° (duration={duration:.1f}s, rx={rx:.2f})", "ROBOT")
+        log(f"Turning {direction} {angle}° (duration={duration:.2f}s, rx={rx:.2f})", "ROBOT")
 
         elapsed = 0.0
         while elapsed < duration:

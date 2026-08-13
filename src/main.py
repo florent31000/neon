@@ -146,11 +146,16 @@ class NeonApp(App):
         if platform != "android":
             return
         try:
-            from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            LayoutParams = autoclass("android.view.WindowManager$LayoutParams")
-            activity = PythonActivity.mActivity
-            activity.getWindow().addFlags(LayoutParams.FLAG_KEEP_SCREEN_ON)
+            from android.runnable import run_on_ui_thread
+
+            @run_on_ui_thread
+            def _set_flag():
+                from jnius import autoclass
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                lp = autoclass("android.view.WindowManager$LayoutParams")
+                act.getWindow().addFlags(lp.FLAG_KEEP_SCREEN_ON)
+
+            _set_flag()
             log("Screen keep-awake enabled")
         except Exception as e:
             log(f"Failed to enable keep-awake: {e}", "WARNING")

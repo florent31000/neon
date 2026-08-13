@@ -9,10 +9,7 @@ the WebSocket receive thread is never blocked by AudioTrack.write().
 Without this, blocking writes cause chunks to pile up and audio cuts out.
 """
 
-import array
-import math
 import queue
-import struct
 import threading
 import time
 from typing import Callable, Optional
@@ -22,42 +19,136 @@ from kivy.utils import platform
 from src.utils.logger import log
 
 
-class HighPassFilter:
-    """Single-pole IIR high-pass filter for PCM16 mono audio.
-    Removes low-frequency noise (fan, motor hum) while preserving voice."""
+class SpectralGateFilter:
+    """Adaptive spectral-gating noise reduction using only numpy.
 
-    def __init__(self, sample_rate: int = 16000, cutoff_hz: float = 250.0):
-        rc = 1.0 / (2.0 * math.pi * cutoff_hz)
-        dt = 1.0 / sample_rate
-        self._alpha = rc / (rc + dt)
-        self._prev_raw = 0.0
-        self._prev_filtered = 0.0
+    Works like noise-cancelling headphones:
+    1. During the first ~1s of audio (calibration phase), learns the
+       spectral profile of the ambient noise (fan, motor, etc.).
+    2. For all subsequent audio, performs STFT, subtracts the learned
+       noise floor (with a safety margin), and reconstructs clean audio.
+
+    This removes *any* stationary background noise, not just a specific
+    frequency — much more effective than notch or high-pass filters.
+    """
+
+    def __init__(self, sample_rate: int = 16000, fft_size: int = 512,
+                 hop_size: int = 256, calibration_chunks: int = 10,
+                 noise_gain: float = 1.5, smoothing: float = 0.02):
+        self._sr = sample_rate
+        self._fft_size = fft_size
+        self._hop_size = hop_size
+        self._calibration_chunks = calibration_chunks
+        self._noise_gain = noise_gain
+        self._smoothing = smoothing
+
+        self._chunk_count = 0
+        self._noise_profile = None
+        self._calibration_frames = []
+        self._prev_tail = None
 
     def process(self, pcm16_bytes: bytes) -> bytes:
-        n_samples = len(pcm16_bytes) // 2
-        samples = struct.unpack(f"<{n_samples}h", pcm16_bytes)
-        out = array.array("h")
+        import numpy as np
 
-        prev_raw = self._prev_raw
-        prev_filt = self._prev_filtered
-        alpha = self._alpha
+        input_samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float64)
+        n_input = len(input_samples)
+        if n_input == 0:
+            return pcm16_bytes
 
-        for s in samples:
-            filtered = alpha * (prev_filt + s - prev_raw)
-            prev_raw = s
-            clamped = max(-32768, min(32767, int(filtered)))
-            prev_filt = filtered
-            out.append(clamped)
+        self._chunk_count += 1
 
-        self._prev_raw = prev_raw
-        self._prev_filtered = prev_filt
-        return out.tobytes()
+        if self._chunk_count <= self._calibration_chunks:
+            self._calibration_frames.append(input_samples.copy())
+            if self._chunk_count == self._calibration_chunks:
+                self._build_noise_profile(np.concatenate(self._calibration_frames))
+                self._calibration_frames = []
+            return pcm16_bytes
+
+        if self._noise_profile is None:
+            return pcm16_bytes
+
+        if self._prev_tail is not None and len(self._prev_tail) > 0:
+            samples = np.concatenate([self._prev_tail, input_samples])
+        else:
+            samples = input_samples
+
+        fft_size = self._fft_size
+        hop = self._hop_size
+        total = len(samples)
+        n_frames = max(0, (total - fft_size) // hop + 1)
+
+        if n_frames == 0:
+            self._prev_tail = samples
+            return pcm16_bytes
+
+        window = np.hanning(fft_size)
+        out_len = n_frames * hop + fft_size
+        out = np.zeros(out_len, dtype=np.float64)
+        win_sum = np.zeros(out_len, dtype=np.float64)
+
+        noise_mag = self._noise_profile
+        gain = self._noise_gain
+        floor_frac = self._smoothing
+
+        for i in range(n_frames):
+            start = i * hop
+            frame = samples[start:start + fft_size] * window
+            spectrum = np.fft.rfft(frame)
+            mag = np.abs(spectrum)
+            phase = np.angle(spectrum)
+
+            clean_mag = mag - gain * noise_mag
+            clean_mag = np.maximum(clean_mag, floor_frac * mag)
+
+            clean_frame = np.fft.irfft(clean_mag * np.exp(1j * phase), n=fft_size)
+
+            out[start:start + fft_size] += clean_frame * window
+            win_sum[start:start + fft_size] += window * window
+
+        win_sum = np.maximum(win_sum, 1e-8)
+        out /= win_sum
+
+        consumed = n_frames * hop
+        self._prev_tail = samples[consumed:].copy() if consumed < total else None
+
+        tail_offset = len(samples) - n_input
+        clean = out[tail_offset:tail_offset + n_input]
+
+        if len(clean) < n_input:
+            padded = np.zeros(n_input, dtype=np.float64)
+            padded[:len(clean)] = clean
+            clean = padded
+
+        return np.clip(clean, -32768, 32767).astype(np.int16).tobytes()
+
+    def _build_noise_profile(self, noise_samples):
+        import numpy as np
+        from src.utils.logger import log
+        fft_size = self._fft_size
+        hop = self._hop_size
+        window = np.hanning(fft_size)
+        total = len(noise_samples)
+        n_frames = max(1, (total - fft_size) // hop + 1)
+
+        mag_sum = np.zeros(fft_size // 2 + 1, dtype=np.float64)
+        for i in range(n_frames):
+            start = i * hop
+            end = start + fft_size
+            if end > total:
+                break
+            frame = noise_samples[start:end] * window
+            mag_sum += np.abs(np.fft.rfft(frame))
+
+        self._noise_profile = mag_sum / n_frames
+        peak_bin = np.argmax(self._noise_profile)
+        peak_freq = peak_bin * self._sr / fft_size
+        log(f"Noise profile calibrated: {n_frames} frames, peak at ~{peak_freq:.0f} Hz", "INFO")
 
 
 class AudioCapture:
     """
     Captures PCM16 mono audio from the microphone.
-    Applies a high-pass filter to remove fan/motor noise.
+    Applies spectral-gating noise reduction (learns ambient noise, then subtracts it).
     Calls on_chunk(bytes) with each audio chunk.
     """
 
@@ -72,7 +163,7 @@ class AudioCapture:
         self._on_chunk = on_chunk
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._hp_filter = HighPassFilter(sample_rate=sample_rate, cutoff_hz=150.0)
+        self._filter = SpectralGateFilter(sample_rate=sample_rate)
 
     def start(self):
         if self._running:
@@ -114,7 +205,7 @@ class AudioCapture:
                 buf = bytearray(self._chunk_size)
                 read = recorder.read(buf, 0, len(buf))
                 if read > 0 and self._on_chunk:
-                    filtered = self._hp_filter.process(bytes(buf[:read]))
+                    filtered = self._filter.process(bytes(buf[:read]))
                     self._on_chunk(filtered)
 
             recorder.stop()
